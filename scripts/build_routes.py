@@ -6,33 +6,37 @@ import sys
 import tempfile
 import urllib.request
 
-# Official Virtual Radar Server Standing Data (Callsigns & Routes)
 SOURCE_URL = "http://www.virtualradarserver.co.uk/Files/StandingData.sqb.gz"
 OUTPUT_BIN = "routes_na.bin"
-TARGET_MAX_RECORDS = 22500  # Stays under 360 KB for ESP32 LittleFS
+TARGET_MAX_RECORDS = 25000  # Stays under 400 KB for ESP32 LittleFS
 
-# North American mainline, regional feeder, and cargo callsign prefixes
-NA_PREFIXES = {
-    # Major US Mainline
-    "AAL", "DAL", "UAL", "SWA", "ASA", "JBU", "FFT", "NKS", "HAL",
-    # Cargo Giants
-    "FDX", "UPS", "GTI", "ATN", "ABX",
-    # Canadian & Mexican Mainline
-    "ACA", "WJA", "TSC", "ROU", "AMX", "VOI", "VIV",
+# North American mainline, regionals, cargo, and major international hub visitors
+TARGET_PREFIXES = {
+    # US Mainline & Low Cost
+    "UAL", "DAL", "AAL", "SWA", "JBU", "ASA", "FFT", "NKS", "AAY", "MXY", "HAL", "SCX", "APF",
     # Regional Feeders (SkyWest, Republic, Envoy, Endeavor, PSA, Piedmont, Mesa, GoJet)
-    "SKW", "RPA", "ENY", "EDV", "JIA", "PDT", "ASH", "GJS", "QXE", "CPZ",
-    # Charter / Commuter / Leisure
-    "SCX", "MXY", "EJA"
+    "SKW", "RPA", "ENY", "EDV", "JIA", "PDT", "ASH", "GJS", "CPZ", "SIL", "POE", "CPA", "JZA", "WEN",
+    # Cargo Carriers
+    "FDX", "UPS", "GTI", "ABX", "ATN", "PAC", "CLX", "CKS", "AJT", "WGN", "BOX",
+    # Canada & Mexico / Central America
+    "ACA", "WJA", "TSC", "ROU", "AMX", "VOI", "VIV", "CMP", "AVA",
+    # Frequent Transatlantic & Transpacific Hub Visitors
+    "BAW", "AFR", "DLH", "VIR", "KLM", "EIN", "IBE", "TAP", "SWR", "AUA", "SAS", "ICE", "LOT",
+    "THY", "QTR", "UAE", "ETD", "ETH", "ANA", "JAL", "KAL",
+    # Business Jet & VIP
+    "EJA", "XOJ", "VJT", "SAM", "EXEC"
 }
 
-def clean_code(code: str) -> str:
-    """Normalizes 4-letter US ICAO (KLGA) to 3-letter (LGA) or preserves 3-letter IATA."""
-    if not code:
-        return "---"
-    code = code.strip().upper()
-    if len(code) == 4 and code.startswith("K"):
-        return code[1:4]
-    return code[:3]
+def clean_airport_code(iata: str, icao: str) -> str:
+    """Normalizes airport to 3-letter IATA or stripped 3-letter ICAO."""
+    if iata and iata != "NULL" and len(iata) == 3:
+        return iata.strip().upper()
+    if icao and icao != "NULL":
+        code = icao.strip().upper()
+        if len(code) == 4 and code.startswith("K"):
+            return code[1:4]
+        return code[:3]
+    return ""
 
 def fetch_and_pack():
     temp_gz = tempfile.NamedTemporaryFile(delete=False, suffix=".gz")
@@ -54,66 +58,71 @@ def fetch_and_pack():
             while chunk := f_in.read(65536):
                 f_out.write(chunk)
 
-        print("Querying route tables...")
+        print("Querying database tables...")
         conn = sqlite3.connect(temp_sqb.name)
         cursor = conn.cursor()
 
-        # Discover schema table names
+        # 1. Discover Tables
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [row[0] for row in cursor.fetchall()]
+        tables = {row[0].lower(): row[0] for row in cursor.fetchall()}
+        print(f"Tables found: {list(tables.values())}")
 
+        airport_tbl = tables.get("airport") or tables.get("airports")
+        route_tbl = tables.get("route") or tables.get("flightroute")
+
+        if not airport_tbl or not route_tbl:
+            print(f"Error: Missing required tables. Found: {list(tables.values())}")
+            sys.exit(1)
+
+        # 2. Map Airport IDs to 3-Letter Airport Codes
+        cursor.execute(f"PRAGMA table_info({airport_tbl});")
+        ap_cols = {c[1].lower(): c[1] for c in cursor.fetchall()}
+        id_col = ap_cols.get("airportid") or ap_cols.get("id")
+        iata_col = ap_cols.get("iata") or ap_cols.get("iatacode")
+        icao_col = ap_cols.get("icao") or ap_cols.get("icaocode")
+
+        print(f"Mapping airports using {airport_tbl} ({id_col}, {iata_col}, {icao_col})...")
+        cursor.execute(f"SELECT {id_col}, {iata_col}, {icao_col} FROM {airport_tbl}")
+        
+        airport_map = {}
+        for row in cursor.fetchall():
+            ap_id = row[0]
+            iata = str(row[1]).strip() if row[1] else ""
+            icao = str(row[2]).strip() if row[2] else ""
+            code = clean_airport_code(iata, icao)
+            if code:
+                airport_map[ap_id] = code
+
+        print(f"Loaded {len(airport_map)} airports.")
+
+        # 3. Query Routes and Resolve Foreign Keys
+        cursor.execute(f"SELECT callsign, fromairportid, toairportid FROM {route_tbl} WHERE callsign IS NOT NULL ORDER BY routeid ASC")
+        
         routes = {}
-
-        # VRS schemas store callsign pairings in FlightRoute or Route
-        target_table = None
-        for t in ["FlightRoute", "Route", "CallsignRoute"]:
-            if t in tables:
-                target_table = t
-                break
-
-        if not target_table:
-            print(f"Error: Could not identify route table. Available tables: {tables}")
-            sys.exit(1)
-
-        # Inspect table columns
-        cursor.execute(f"PRAGMA table_info({target_table});")
-        cols = [c[1].lower() for c in cursor.fetchall()]
-
-        cs_col = next((c for c in cols if "callsign" in c), None)
-        from_col = next((c for c in cols if c in ["from", "fromairport", "orig", "origin"]), None)
-        to_col = next((c for c in cols if c in ["to", "toairport", "dest", "destination"]), None)
-
-        if not (cs_col and from_col and to_col):
-            print(f"Error: Missing route columns in {target_table}. Columns found: {cols}")
-            sys.exit(1)
-
-        query = f"SELECT {cs_col}, {from_col}, {to_col} FROM {target_table} WHERE {cs_col} IS NOT NULL"
-        cursor.execute(query)
-
         for row in cursor.fetchall():
             raw_cs = str(row[0]).strip().upper()
-            raw_from = str(row[1]).strip().upper() if row[1] else ""
-            raw_to = str(row[2]).strip().upper() if row[2] else ""
+            from_id = row[1]
+            to_id = row[2]
 
-            if len(raw_cs) < 4 or not raw_from or not raw_to:
+            if len(raw_cs) < 4:
                 continue
 
             prefix = raw_cs[:3]
-            if prefix in NA_PREFIXES:
-                orig = clean_code(raw_from)
-                dest = clean_code(raw_to)
-                if orig != "---" and dest != "---":
+            if prefix in TARGET_PREFIXES:
+                orig = airport_map.get(from_id)
+                dest = airport_map.get(to_id)
+                if orig and dest and orig != dest:
                     routes[raw_cs] = (orig, dest)
 
         conn.close()
-        print(f"Extracted {len(routes)} valid North American commercial routes.")
+        print(f"Resolved {len(routes)} target commercial routes.")
 
-        # Sort alphabetically by callsign for ESP32 bsearch()
+        # 4. Sort alphabetically for O(log N) bsearch on ESP32
         sorted_callsigns = sorted(routes.keys())
         if len(sorted_callsigns) > TARGET_MAX_RECORDS:
             sorted_callsigns = sorted_callsigns[:TARGET_MAX_RECORDS]
 
-        print(f"Packing {len(sorted_callsigns)} routes into {OUTPUT_BIN}...")
+        # 5. Pack into 16-byte records: <8s4s4s
         packed_data = bytearray()
         record_format = "<8s4s4s"
 
@@ -132,7 +141,7 @@ def fetch_and_pack():
             f_bin.write(packed_data)
 
         size_kb = len(packed_data) / 1024.0
-        print(f"Success: {OUTPUT_BIN} generated ({len(sorted_callsigns)} entries, {size_kb:.2f} KB)")
+        print(f"Success: Generated {OUTPUT_BIN} ({len(sorted_callsigns)} entries, {size_kb:.2f} KB)")
 
     finally:
         if os.path.exists(temp_gz.name):
