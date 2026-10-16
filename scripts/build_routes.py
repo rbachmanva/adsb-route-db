@@ -8,7 +8,7 @@ import urllib.request
 
 SOURCE_URL = "http://www.virtualradarserver.co.uk/Files/StandingData.sqb.gz"
 OUTPUT_BIN = "routes_na.bin"
-TARGET_MAX_RECORDS = 25000  # Stays under 400 KB for ESP32 LittleFS
+TARGET_MAX_RECORDS = 250000  # Stays under 400 KB for ESP32 LittleFS
 
 # North American mainline, regionals, cargo, and major international hub visitors
 TARGET_PREFIXES = {
