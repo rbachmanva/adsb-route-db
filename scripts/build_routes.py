@@ -6,7 +6,7 @@ import urllib.request
 ROUTES_URL   = "https://vrs-standing-data.adsb.lol/routes.csv"
 AIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
 OUTPUT_BIN   = "routes_na.bin"
-MAX_RECORDS  = 25000
+MAX_RECORDS  = 250000
 
 # Major North American & International Commercial Carriers flying in NA airspace
 TARGET_CARRIERS = {
