@@ -1,153 +1,257 @@
-import gzip
-import os
-import sqlite3
+import csv
+import io
 import struct
-import sys
-import tempfile
 import urllib.request
 
-SOURCE_URL = "http://www.virtualradarserver.co.uk/Files/StandingData.sqb.gz"
-OUTPUT_BIN = "routes_na.bin"
-TARGET_MAX_RECORDS = 250000  # Stays under 400 KB for ESP32 LittleFS
+ROUTES_URL   = "https://vrs-standing-data.adsb.lol/routes.csv"
+AIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
+OUTPUT_BIN   = "routes_na.bin"
+MAX_RECORDS  = 25000
 
-# North American mainline, regionals, cargo, and major international hub visitors
-TARGET_PREFIXES = {
-    # US Mainline & Low Cost
-    "UAL", "DAL", "AAL", "SWA", "JBU", "ASA", "FFT", "NKS", "AAY", "MXY", "HAL", "SCX", "APF",
-    # Regional Feeders (SkyWest, Republic, Envoy, Endeavor, PSA, Piedmont, Mesa, GoJet)
-    "SKW", "RPA", "ENY", "EDV", "JIA", "PDT", "ASH", "GJS", "CPZ", "SIL", "POE", "CPA", "JZA", "WEN",
-    # Cargo Carriers
-    "FDX", "UPS", "GTI", "ABX", "ATN", "PAC", "CLX", "CKS", "AJT", "WGN", "BOX",
-    # Canada & Mexico / Central America
-    "ACA", "WJA", "TSC", "ROU", "AMX", "VOI", "VIV", "CMP", "AVA",
-    # Frequent Transatlantic & Transpacific Hub Visitors
-    "BAW", "AFR", "DLH", "VIR", "KLM", "EIN", "IBE", "TAP", "SWR", "AUA", "SAS", "ICE", "LOT",
-    "THY", "QTR", "UAE", "ETD", "ETH", "ANA", "JAL", "KAL",
-    # Business Jet & VIP
-    "EJA", "XOJ", "VJT", "SAM", "EXEC"
+# Major North American & International Commercial Carriers flying in NA airspace
+TARGET_CARRIERS = {
+    "AAL", "AAY", "ABX", "ACA", "AFR", "AJT", "AMX", "ANA", "ASA", "ASH",
+    "ATN", "AUA", "AVA", "AZU", "BAW", "BEL", "BOX", "BWA", "CCA", "CKS",
+    "CLX", "CMP", "CPA", "DAL", "DLH", "EDV", "EIN", "EJA", "ENY", "ETD",
+    "ETH", "EVA", "FDX", "FFT", "GJS", "GLO", "GTI", "HAL", "IBE", "ICE",
+    "JAL", "JBU", "JIA", "JZA", "KAC", "KAL", "KLM", "LAN", "LXJ", "MSR",
+    "MXY", "NCR", "NKS", "PAC", "PDT", "POE", "QFA", "QTR", "QXE", "RAM",
+    "RJA", "ROU", "RPA", "SAS", "SCX", "SKW", "SVA", "SWA", "SWR", "TAM",
+    "TAP", "THY", "TSC", "UAE", "UAL", "UCA", "UPS", "VIR", "VIV", "VJT",
+    "VOI", "WJA", "XOJ"
 }
 
-def clean_airport_code(iata: str, icao: str) -> str:
-    """Normalizes airport to 3-letter IATA or stripped 3-letter ICAO."""
-    if iata and iata != "NULL" and len(iata) == 3:
-        return iata.strip().upper()
-    if icao and icao != "NULL":
-        code = icao.strip().upper()
-        if len(code) == 4 and code.startswith("K"):
-            return code[1:4]
-        return code[:3]
-    return ""
+def download_text(url):
+    print(f"Downloading {url}...")
+    req = urllib.request.Request(url, headers={"User-Agent": "ESP32P4-RouteUpdater/2.0"})
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
-def fetch_and_pack():
-    temp_gz = tempfile.NamedTemporaryFile(delete=False, suffix=".gz")
-    temp_sqb = tempfile.NamedTemporaryFile(delete=False, suffix=".sqb")
-    temp_gz.close()
-    temp_sqb.close()
+def build_database():
+    # 1. Parse OurAirports CSV (ident, iata_code -> municipality, lat, lon)
+    airports_raw = download_text(AIRPORTS_URL)
+    airports = {}
+    reader = csv.reader(io.StringIO(airports_raw))
+    header = next(reader, None)
 
-    try:
-        print(f"Downloading standing data from {SOURCE_URL}...")
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        req = urllib.request.Request(SOURCE_URL, headers=headers)
-        
-        with urllib.request.urlopen(req, timeout=60) as resp, open(temp_gz.name, "wb") as f_out:
-            while chunk := resp.read(65536):
-                f_out.write(chunk)
+    for row in reader:
+        if len(row) < 14:
+            continue
+        ident = row[1].strip().upper()
+        lat_s = row[4].strip()
+        lon_s = row[5].strip()
+        city  = row[10].strip()
+        iata  = row[13].strip().upper()
 
-        print("Decompressing SQLite database...")
-        with gzip.open(temp_gz.name, "rb") as f_in, open(temp_sqb.name, "wb") as f_out:
-            while chunk := f_in.read(65536):
-                f_out.write(chunk)
+        if not ident or not city:
+            continue
+        try:
+            lat = float(lat_s)
+            lon = float(lon_s)
+        except ValueError:
+            continue
 
-        print("Querying database tables...")
-        conn = sqlite3.connect(temp_sqb.name)
-        cursor = conn.cursor()
+        # Clean up long city names (e.g. "Washington, D.C." -> "Washington")
+        city_clean = city.split("/")[0].split(",")[0].strip()
+        if not city_clean:
+            city_clean = iata if iata else ident
 
-        # 1. Discover Tables
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = {row[0].lower(): row[0] for row in cursor.fetchall()}
-        print(f"Tables found: {list(tables.values())}")
+        info = (city_clean[:15], lat, lon)
+        airports[ident] = info
+        if len(iata) == 3:
+            airports[iata] = info
 
-        airport_tbl = tables.get("airport") or tables.get("airports")
-        route_tbl = tables.get("route") or tables.get("flightroute")
+    print(f"Loaded {len(airports)} airport lookup keys from OurAirports.")
 
-        if not airport_tbl or not route_tbl:
-            print(f"Error: Missing required tables. Found: {list(tables.values())}")
-            sys.exit(1)
+    # 2. Parse adsb.lol routes.csv
+    # Columns: 0:Callsign, 1:Code, 2:Number, 3:AirlineCode, 4:AirportCodes
+    routes_raw = download_text(ROUTES_URL)
+    reader = csv.reader(io.StringIO(routes_raw))
+    next(reader, None)  # Skip header
 
-        # 2. Map Airport IDs to 3-Letter Airport Codes
-        cursor.execute(f"PRAGMA table_info({airport_tbl});")
-        ap_cols = {c[1].lower(): c[1] for c in cursor.fetchall()}
-        id_col = ap_cols.get("airportid") or ap_cols.get("id")
-        iata_col = ap_cols.get("iata") or ap_cols.get("iatacode")
-        icao_col = ap_cols.get("icao") or ap_cols.get("icaocode")
+    routes = {}
+    for row in reader:
+        if len(row) < 5:
+            continue
+        callsign = row[0].strip().upper()
+        airline  = row[3].strip().upper()
+        ap_codes = row[4].strip().upper()
 
-        print(f"Mapping airports using {airport_tbl} ({id_col}, {iata_col}, {icao_col})...")
-        cursor.execute(f"SELECT {id_col}, {iata_col}, {icao_col} FROM {airport_tbl}")
-        
-        airport_map = {}
-        for row in cursor.fetchall():
-            ap_id = row[0]
-            iata = str(row[1]).strip() if row[1] else ""
-            icao = str(row[2]).strip() if row[2] else ""
-            code = clean_airport_code(iata, icao)
-            if code:
-                airport_map[ap_id] = code
+        if len(callsign) < 4 or len(callsign) > 7 or "-" not in ap_codes:
+            continue
 
-        print(f"Loaded {len(airport_map)} airports.")
+        prefix = airline if len(airline) == 3 else callsign[:3]
+        if prefix not in TARGET_CARRIERS:
+            continue
 
-        # 3. Query Routes and Resolve Foreign Keys
-        cursor.execute(f"SELECT callsign, fromairportid, toairportid FROM {route_tbl} WHERE callsign IS NOT NULL ORDER BY routeid ASC")
-        
-        routes = {}
-        for row in cursor.fetchall():
-            raw_cs = str(row[0]).strip().upper()
-            from_id = row[1]
-            to_id = row[2]
+        parts = [p.strip() for p in ap_codes.split("-") if p.strip()]
+        if len(parts) < 2:
+            continue
 
-            if len(raw_cs) < 4:
-                continue
+        orig_code = parts[0]
+        dest_code = parts[-1]
+        if orig_code == dest_code:
+            continue
 
-            prefix = raw_cs[:3]
-            if prefix in TARGET_PREFIXES:
-                orig = airport_map.get(from_id)
-                dest = airport_map.get(to_id)
-                if orig and dest and orig != dest:
-                    routes[raw_cs] = (orig, dest)
+        orig_info = airports.get(orig_code)
+        dest_info = airports.get(dest_code)
+        if not orig_info or not dest_info:
+            continue
 
-        conn.close()
-        print(f"Resolved {len(routes)} target commercial routes.")
+        routes[callsign] = (orig_info, dest_info)
 
-        # 4. Sort alphabetically for O(log N) bsearch on ESP32
-        sorted_callsigns = sorted(routes.keys())
-        if len(sorted_callsigns) > TARGET_MAX_RECORDS:
-            sorted_callsigns = sorted_callsigns[:TARGET_MAX_RECORDS]
+    sorted_keys = sorted(routes.keys())
+    if len(sorted_keys) > MAX_RECORDS:
+        sorted_keys = sorted_keys[:MAX_RECORDS]
 
-        # 5. Pack into 16-byte records: <8s4s4s
-        packed_data = bytearray()
-        record_format = "<8s4s4s"
+    # Pack 48-byte binary struct:
+    # <8s (callsign) 16s (orig_city) 16s (dest_city) 4h (orig_lat*100, orig_lon*100, dest_lat*100, dest_lon*100)
+    packed = bytearray()
+    for cs in sorted_keys:
+        (o_city, o_lat, o_lon), (d_city, d_lat, d_lon) = routes[cs]
+        packed.extend(struct.pack(
+            "<8s16s16s4h",
+            cs.encode("ascii", "ignore"),
+            o_city.encode("ascii", "ignore"),
+            d_city.encode("ascii", "ignore"),
+            int(round(o_lat * 100)),
+            int(round(o_lon * 100)),
+            int(round(d_lat * 100)),
+            int(round(d_lon * 100))
+        ))
 
-        for cs in sorted_callsigns:
-            orig, dest = routes[cs]
-            packed_data.extend(
-                struct.pack(
-                    record_format,
-                    cs.encode("ascii", "ignore"),
-                    orig.encode("ascii", "ignore"),
-                    dest.encode("ascii", "ignore")
-                )
-            )
+    with open(OUTPUT_BIN, "wb") as f:
+        f.write(packed)
 
-        with open(OUTPUT_BIN, "wb") as f_bin:
-            f_bin.write(packed_data)
-
-        size_kb = len(packed_data) / 1024.0
-        print(f"Success: Generated {OUTPUT_BIN} ({len(sorted_callsigns)} entries, {size_kb:.2f} KB)")
-
-    finally:
-        if os.path.exists(temp_gz.name):
-            os.remove(temp_gz.name)
-        if os.path.exists(temp_sqb.name):
-            os.remove(temp_sqb.name)
+    print(f"Success: Packed {len(sorted_keys)} routes ({len(packed)/1024:.1f} KB) into {OUTPUT_BIN}")
 
 if __name__ == "__main__":
-    fetch_and_pack()
+    build_database()import csv
+import io
+import struct
+import urllib.request
+
+ROUTES_URL   = "https://vrs-standing-data.adsb.lol/routes.csv"
+AIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
+OUTPUT_BIN   = "routes_na.bin"
+MAX_RECORDS  = 25000
+
+# Major North American & International Commercial Carriers flying in NA airspace
+TARGET_CARRIERS = {
+    "AAL", "AAY", "ABX", "ACA", "AFR", "AJT", "AMX", "ANA", "ASA", "ASH",
+    "ATN", "AUA", "AVA", "AZU", "BAW", "BEL", "BOX", "BWA", "CCA", "CKS",
+    "CLX", "CMP", "CPA", "DAL", "DLH", "EDV", "EIN", "EJA", "ENY", "ETD",
+    "ETH", "EVA", "FDX", "FFT", "GJS", "GLO", "GTI", "HAL", "IBE", "ICE",
+    "JAL", "JBU", "JIA", "JZA", "KAC", "KAL", "KLM", "LAN", "LXJ", "MSR",
+    "MXY", "NCR", "NKS", "PAC", "PDT", "POE", "QFA", "QTR", "QXE", "RAM",
+    "RJA", "ROU", "RPA", "SAS", "SCX", "SKW", "SVA", "SWA", "SWR", "TAM",
+    "TAP", "THY", "TSC", "UAE", "UAL", "UCA", "UPS", "VIR", "VIV", "VJT",
+    "VOI", "WJA", "XOJ"
+}
+
+def download_text(url):
+    print(f"Downloading {url}...")
+    req = urllib.request.Request(url, headers={"User-Agent": "ESP32P4-RouteUpdater/2.0"})
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+def build_database():
+    # 1. Parse OurAirports CSV (ident, iata_code -> municipality, lat, lon)
+    airports_raw = download_text(AIRPORTS_URL)
+    airports = {}
+    reader = csv.reader(io.StringIO(airports_raw))
+    header = next(reader, None)
+
+    for row in reader:
+        if len(row) < 14:
+            continue
+        ident = row[1].strip().upper()
+        lat_s = row[4].strip()
+        lon_s = row[5].strip()
+        city  = row[10].strip()
+        iata  = row[13].strip().upper()
+
+        if not ident or not city:
+            continue
+        try:
+            lat = float(lat_s)
+            lon = float(lon_s)
+        except ValueError:
+            continue
+
+        # Clean up long city names (e.g. "Washington, D.C." -> "Washington")
+        city_clean = city.split("/")[0].split(",")[0].strip()
+        if not city_clean:
+            city_clean = iata if iata else ident
+
+        info = (city_clean[:15], lat, lon)
+        airports[ident] = info
+        if len(iata) == 3:
+            airports[iata] = info
+
+    print(f"Loaded {len(airports)} airport lookup keys from OurAirports.")
+
+    # 2. Parse adsb.lol routes.csv
+    # Columns: 0:Callsign, 1:Code, 2:Number, 3:AirlineCode, 4:AirportCodes
+    routes_raw = download_text(ROUTES_URL)
+    reader = csv.reader(io.StringIO(routes_raw))
+    next(reader, None)  # Skip header
+
+    routes = {}
+    for row in reader:
+        if len(row) < 5:
+            continue
+        callsign = row[0].strip().upper()
+        airline  = row[3].strip().upper()
+        ap_codes = row[4].strip().upper()
+
+        if len(callsign) < 4 or len(callsign) > 7 or "-" not in ap_codes:
+            continue
+
+        prefix = airline if len(airline) == 3 else callsign[:3]
+        if prefix not in TARGET_CARRIERS:
+            continue
+
+        parts = [p.strip() for p in ap_codes.split("-") if p.strip()]
+        if len(parts) < 2:
+            continue
+
+        orig_code = parts[0]
+        dest_code = parts[-1]
+        if orig_code == dest_code:
+            continue
+
+        orig_info = airports.get(orig_code)
+        dest_info = airports.get(dest_code)
+        if not orig_info or not dest_info:
+            continue
+
+        routes[callsign] = (orig_info, dest_info)
+
+    sorted_keys = sorted(routes.keys())
+    if len(sorted_keys) > MAX_RECORDS:
+        sorted_keys = sorted_keys[:MAX_RECORDS]
+
+    # Pack 48-byte binary struct:
+    # <8s (callsign) 16s (orig_city) 16s (dest_city) 4h (orig_lat*100, orig_lon*100, dest_lat*100, dest_lon*100)
+    packed = bytearray()
+    for cs in sorted_keys:
+        (o_city, o_lat, o_lon), (d_city, d_lat, d_lon) = routes[cs]
+        packed.extend(struct.pack(
+            "<8s16s16s4h",
+            cs.encode("ascii", "ignore"),
+            o_city.encode("ascii", "ignore"),
+            d_city.encode("ascii", "ignore"),
+            int(round(o_lat * 100)),
+            int(round(o_lon * 100)),
+            int(round(d_lat * 100)),
+            int(round(d_lon * 100))
+        ))
+
+    with open(OUTPUT_BIN, "wb") as f:
+        f.write(packed)
+
+    print(f"Success: Packed {len(sorted_keys)} routes ({len(packed)/1024:.1f} KB) into {OUTPUT_BIN}")
+
+if __name__ == "__main__":
+    build_database()
