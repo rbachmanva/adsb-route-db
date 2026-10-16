@@ -2,50 +2,8 @@ name: Update ADS-B Routes DB
 
 on:
   schedule:
-    - cron: '0 3 1 * *'  # Runs at 03:00 UTC on the 1st of every month
-  workflow_dispatch:     # Manual trigger button
-
-permissions:
-  contents: write
-
-concurrency:
-  group: route-db-updater
-  cancel-in-progress: true
-
-jobs:
-  build-and-commit:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Generate Binary Route Table
-        run: python scripts/build_routes.py
-
-      - name: Commit and Push if Changed
-        run: |
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add routes_na.bin
-          if git diff --staged --quiet; then
-            echo "No route updates detected."
-          else
-            git commit -m "Auto-update routes_na.bin [$(date -u +'%Y-%m-%d')]"
-            git pull --rebase -X ours origin main
-            git push origin HEAD:main
-          finame: Update ADS-B Routes DB
-
-on:
-  schedule:
-    - cron: '0 3 1 * *'  # Runs at 03:00 UTC on the 1st of every month
-  workflow_dispatch:     # Manual trigger button
+    - cron: '0 3 1 * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
