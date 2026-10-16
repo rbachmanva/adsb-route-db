@@ -2,9 +2,9 @@ name: Update ADS-B Routes DB
 
 on:
   schedule:
-    - cron: '0 3 1 * *'
+    - cron: '0 3 * * 0'  # Runs weekly every Sunday at 03:00 UTC
   workflow_dispatch:
-
+  
 permissions:
   contents: write
 
