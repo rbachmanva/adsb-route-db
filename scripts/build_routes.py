@@ -6,7 +6,7 @@ import urllib.request
 ROUTES_URL   = "https://vrs-standing-data.adsb.lol/routes.csv"
 AIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
 OUTPUT_BIN   = "routes_na.bin"
-MAX_RECORDS  = 30000
+MAX_RECORDS  = 300000
 
 # US & territories ISO country codes in OurAirports
 US_COUNTRIES = {"US", "PR", "VI", "GU", "MP", "AS"}
