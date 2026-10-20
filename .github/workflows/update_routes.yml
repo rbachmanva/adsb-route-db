@@ -2,9 +2,10 @@ name: Update ADS-B Routes DB
 
 on:
   schedule:
-    - cron: '0 3 * * 0'  # Runs weekly every Sunday at 03:00 UTC
-  workflow_dispatch:
-  
+    # Runs twice daily at 05:00 and 17:00 UTC (~01:00 and 13:00 Eastern)
+    - cron: '0 5,17 * * *'
+  workflow_dispatch:     # Enables manual trigger button
+
 permissions:
   contents: write
 
@@ -26,18 +27,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Generate Binary Route Table
+      - name: Install Dependencies
+        run: pip install FlightRadarAPI
+
+      - name: Generate Hybrid Binary Route Table
         run: python scripts/build_routes.py
 
       - name: Commit and Push if Changed
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add routes_na.bin
+          git add routes_master.json routes.bin
           if git diff --staged --quiet; then
             echo "No route updates detected."
           else
-            git commit -m "Auto-update routes_na.bin [$(date -u +'%Y-%m-%d')]"
+            git commit -m "Auto-update hybrid routes.bin [$(date -u +'%Y-%m-%d %H:%M UTC')]"
             git pull --rebase -X ours origin main
             git push origin HEAD:main
           fi
