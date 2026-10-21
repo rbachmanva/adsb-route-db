@@ -5,7 +5,10 @@ import json
 import time
 import struct
 import urllib.request
-from FlightRadar24 import FlightRadar24API
+try:
+    from FlightRadar24 import FlightRadar24API
+except ModuleNotFoundError:
+    from FlightRadarAPI import FlightRadar24API
 
 MASTER_JSON      = "routes_master.json"
 OUTPUT_BIN       = "routes.bin"
